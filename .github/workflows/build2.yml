@@ -1,0 +1,69 @@
+name: Groupoid Axiom Scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld libomp-dev
+          curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+      
+      - name: Install Nim packages
+        run: nimble install -y checksums
+      
+      - name: Build generator
+        run: |
+          clang++ -std=c++17 \
+            -O3 \
+            -march=native \
+            -flto=full \
+            -funroll-loops \
+            -fomit-frame-pointer \
+            -fno-plt \
+            -DNDEBUG \
+            -fuse-ld=lld \
+            -fopenmp \
+            gen_models.cpp -o gen_models
+      
+      - name: Generate models
+        run: ./gen_models
+      
+      - name: Build scanner and merger
+        run: |
+          nim c \
+            -d:danger \
+            -d:useMalloc \
+            --mm:orc \
+            --panics:on \
+            --cc:clang \
+            --passC:"-O3 -march=native -flto=full -funroll-loops -fno-plt -fomit-frame-pointer -fvisibility=hidden -mllvm -inline-threshold=1500 -mllvm -unroll-threshold=500" \
+            --passL:"-flto=full -fuse-ld=lld -Wl,-O3 -Wl,--icf=all -s" \
+            scan.nim
+          nim c -d:release merge.nim
+      
+      - name: Run parallel scans
+        run: |
+          ./scan 4 0 > result_0.jsonl &
+          ./scan 4 1 > result_1.jsonl &
+          ./scan 4 2 > result_2.jsonl &
+          ./scan 4 3 > result_3.jsonl &
+          wait
+      
+      - name: Merge results
+        run: ./merge result_0.jsonl result_1.jsonl result_2.jsonl result_3.jsonl
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: axioms
+          path: axioms_multi.txt
