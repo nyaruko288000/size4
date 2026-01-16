@@ -13,7 +13,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld libomp-dev
+          sudo apt-get install -y clang lld libomp-dev zstd
       
       - name: Build generator
         run: |
@@ -32,8 +32,11 @@ jobs:
       - name: Generate models
         run: ./gen_models
       
-      - name: Upload bin files
+      - name: Compress bin files
+        run: zstd -19 --rm *.bin
+      
+      - name: Upload compressed files
         uses: actions/upload-artifact@v4
         with:
           name: bin-files
-          path: "*.bin"
+          path: "*.bin.zst"
