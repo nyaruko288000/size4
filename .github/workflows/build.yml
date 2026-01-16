@@ -1,0 +1,43 @@
+name: Build and Run Groupoid Enumeration
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang lld libomp-dev zstd
+      
+      - name: Build
+        run: |
+          clang++ -std=c++23 \
+            -O3 \
+            -march=native -mtune=native \
+            -flto=thin \
+            -funroll-loops \
+            -fomit-frame-pointer \
+            -fno-plt \
+            -fopenmp \
+            -DNDEBUG \
+            -fuse-ld=lld \
+            -pthread \
+            math.cpp -o math
+      
+      - name: Run
+        run: ./math
+      
+      - name: Merge and compress
+        run: |
+          cat chunk_*.bin > groupoids.bin
+          zstd -19 --rm groupoids.bin -o groupoids.bin.zst
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: groupoids
+          path: groupoids.bin.zst
