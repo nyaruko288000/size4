@@ -60,8 +60,7 @@ jobs:
           wait
       
       - name: Merge results
-        run: ./merge_o
-3 result_0.jsonl result_1.jsonl result_2.jsonl result_3.jsonl
+        run: ./merge_o 3 result_0.jsonl result_1.jsonl result_2.jsonl result_3.jsonl
       
       - name: Upload results
         uses: actions/upload-artifact@v4
