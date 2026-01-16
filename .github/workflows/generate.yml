@@ -1,0 +1,39 @@
+name: Generated graph
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld libomp-dev
+      
+      - name: Build generator
+        run: |
+          clang++ -std=c++17 \
+            -O3 \
+            -march=native \
+            -flto=full \
+            -funroll-loops \
+            -fomit-frame-pointer \
+            -fno-plt \
+            -DNDEBUG \
+            -fuse-ld=lld \
+            -fopenmp \
+            gen_models.cpp -o gen_models
+      
+      - name: Generate models
+        run: ./gen_models
+      
+      - name: Upload bin files
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-files
+          path: "*.bin"
