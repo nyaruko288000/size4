@@ -20,7 +20,14 @@ static u32 LUT[24][2][1u << 16];
 
 static void build_perms() {
     std::array<std::uint8_t, 4> p{0, 1, 2, 3};
- error\n";
+    int k = 0;
+
+    do {
+        PERMS[k++] = p;
+    } while (std::next_permutation(p.begin(), p.end()));
+
+    if (k != 24) {
+        std::cerr << "Permutation generation error\n";
         std::exit(1);
     }
 }
