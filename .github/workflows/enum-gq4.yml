@@ -1,0 +1,131 @@
+name: Enumerate 4-order groupoids
+
+on:
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: "运行枚举程序使用的线程数；0 表示使用 nproc"
+        required: true
+        default: "0"
+      runner:
+        description: "运行用的 runner；GitHub-hosted 可能 6 小时超时，建议必要时用 self-hosted"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - ubuntu-24.04
+          - self-hosted
+      artifact_name:
+        description: "上传产物名称"
+        required: true
+        default: "gq4-bin-zstd"
+
+concurrency:
+  group: enum-gq4-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  enumerate:
+    name: Build, run, zstd-compress, upload
+    runs-on: ${{ inputs.runner }}
+
+    # GitHub-hosted runner 单个 job 通常最多 360 分钟。
+    # 如果程序跑不完，建议使用 self-hosted runner。
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y \
+              build-essential \
+              g++ \
+              zstd \
+              coreutils \
+              time
+          else
+            echo "This workflow currently expects an apt-based Linux runner."
+            exit 1
+          fi
+
+          g++ --version
+          zstd --version
+          nproc
+
+      - name: Compile
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          g++ \
+            -O3 \
+            -march=native \
+            -mtune=native \
+            -flto \
+            -std=c++20 \
+            -pthread \
+            enum_gq4.cpp \
+            -o enum_gq4
+
+          ls -lh enum_gq4
+
+      - name: Run enumeration
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          THREADS="${{ inputs.threads }}"
+          if [ -z "$THREADS" ] || [ "$THREADS" = "0" ]; then
+            THREADS="$(nproc)"
+          fi
+
+          echo "Using THREADS=$THREADS"
+
+          /usr/bin/time -v ./enum_gq4 gq4.bin "$THREADS" 2>&1 | tee enum_gq4.log
+
+          ls -lh gq4.bin
+          sha256sum gq4.bin > gq4.bin.sha256
+
+      - name: Compress with zstd level 19 T0
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # -19: 高压缩级别
+          # -T0: 使用所有可用 CPU 线程
+          # -f : 覆盖已有输出
+          /usr/bin/time -v zstd -19 -T0 -f --no-progress gq4.bin -o gq4.bin.zst
+
+          sha256sum gq4.bin.zst > gq4.bin.zst.sha256
+
+          ls -lh gq4.bin gq4.bin.zst
+          cat gq4.bin.sha256
+          cat gq4.bin.zst.sha256
+
+          # 不上传未压缩的 gq4.bin，节省 artifact 体积。
+          rm -f gq4.bin
+
+      - name: Upload compressed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: |
+            gq4.bin.zst
+            gq4.bin.zst.sha256
+            gq4.bin.sha256
+            enum_gq4.log
+          if-no-files-found: error
+
+          # 这里让 GitHub artifact 再做一层 ZIP 压缩。
+          # 对 .zst 文件通常收益不大，但你说的这类数据可能还能再吃掉一点冗余。
+          compression-level: 9
+
+          retention-days: 14
