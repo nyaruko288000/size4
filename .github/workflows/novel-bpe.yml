@@ -498,10 +498,10 @@ jobs:
 
           stats["tokenizer_zstd_bytes"] = (
               p / "tokenizer.json.zst"
-          ).stat().st_size()
+          ).stat().st_size
           stats["ids_zstd_bytes"] = (
               p / "ids.u16le.zst"
-          ).stat().st_size()
+          ).stat().st_size
           stats["total_zstd_bytes"] = (
               stats["tokenizer_zstd_bytes"] + stats["ids_zstd_bytes"]
           )
