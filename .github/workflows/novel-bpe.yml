@@ -95,7 +95,8 @@ jobs:
           use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
           use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
           use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-          use tokenizers::{Tokenizer, TrainerWrapper};
+          use tokenizers::models::TrainerWrapper;
+          use tokenizers::Tokenizer;
 
           fn main() -> Result<()> {
               let args: Vec<String> = std::env::args().collect();
@@ -139,7 +140,7 @@ jobs:
                   .show_progress(false)
                   .vocab_size(vocab_size)
                   .min_frequency(4)
-                  .initial_alphabet(ByteLevel::alphabet())
+                  .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
                   .build();
 
               let mut trainer: TrainerWrapper = trainer.into();
