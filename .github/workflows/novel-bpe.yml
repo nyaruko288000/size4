@@ -1,0 +1,727 @@
+name: Novel BPE compression benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_file_id:
+        description: Google Drive file ID
+        required: true
+        default: "1X28JC1R4io9sCuT8fI2re4kLzhv_78GS"
+      per_vocab_minutes:
+        description: Maximum minutes per vocabulary size
+        required: true
+        default: "45"
+      zstd_level:
+        description: zstd level used for all primary comparisons
+        required: true
+        default: "19"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      CARGO_TERM_COLOR: always
+      # Restrict parallelism to reduce memory pressure.
+      RAYON_NUM_THREADS: "2"
+      TOKENIZERS_PARALLELISM: "true"
+      CARGO_BUILD_JOBS: "2"
+      DRIVE_FILE_ID: ${{ inputs.drive_file_id }}
+      PER_VOCAB_MINUTES: ${{ inputs.per_vocab_minutes }}
+      ZSTD_LEVEL: ${{ inputs.zstd_level }}
+
+    steps:
+      - name: Install tools and validate settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$PER_VOCAB_MINUTES" =~ ^[0-9]+$ ]]
+          [[ "$ZSTD_LEVEL" =~ ^[0-9]+$ ]]
+          (( PER_VOCAB_MINUTES >= 1 && PER_VOCAB_MINUTES <= 50 ))
+          (( ZSTD_LEVEL >= 1 && ZSTD_LEVEL <= 19 ))
+
+          sudo apt-get update
+          sudo apt-get install -y zstd time
+
+          python3 -m venv .venv
+          .venv/bin/pip install "gdown==5.2.0"
+
+          mkdir -p work results/dist results/logs results/source
+
+          {
+            uname -a
+            echo
+            free -h
+            echo
+            df -h .
+            echo
+            zstd --version
+          } | tee results/environment.txt
+
+      - name: Generate Rust project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bpe-bench/src
+
+          cat > bpe-bench/Cargo.toml <<'EOF'
+          [package]
+          name = "novel-bpe-bench"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          anyhow = "1"
+          serde_json = "1"
+          tokenizers = {
+            version = "=0.21.4",
+            default-features = false,
+            features = ["onig", "progressbar"]
+          }
+          EOF
+
+          cat > bpe-bench/src/main.rs <<'EOF'
+          use anyhow::{anyhow, bail, Context, Result};
+          use std::fs::{self, File};
+          use std::io::{BufRead, BufReader, BufWriter, Write};
+          use std::path::Path;
+          use std::time::Instant;
+
+          use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+          use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
+          use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+          use tokenizers::{Tokenizer, TrainerWrapper};
+
+          fn main() -> Result<()> {
+              let args: Vec<String> = std::env::args().collect();
+
+              if args.len() != 4 {
+                  bail!(
+                      "Usage: {} <prepared-utf8-text> <vocab-size> <output-directory>",
+                      args[0]
+                  );
+              }
+
+              let input = &args[1];
+              let vocab_size: usize = args[2].parse()?;
+              let out_dir = Path::new(&args[3]);
+
+              if !(256..=65536).contains(&vocab_size) {
+                  bail!("Vocabulary size must be between 256 and 65536");
+              }
+
+              fs::create_dir_all(out_dir)?;
+              let started = Instant::now();
+
+              // No normalization, no synthetic prefix space, no special tokens.
+              let model = BPE::builder()
+                  .build()
+                  .map_err(|e| anyhow!(e.to_string()))?;
+
+              let mut tokenizer = Tokenizer::new(model);
+
+              // Keep GPT-2 regex splitting as the first baseline.
+              // Consecutive Chinese characters can still merge into words/phrases.
+              tokenizer.with_pre_tokenizer(Some(ByteLevel::new(
+                  false, // add_prefix_space
+                  false, // trim_offsets
+                  true,  // use_regex
+              )));
+
+              tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+
+              let trainer = BpeTrainerBuilder::new()
+                  .show_progress(false)
+                  .vocab_size(vocab_size)
+                  .min_frequency(4)
+                  .initial_alphabet(ByteLevel::alphabet())
+                  .build();
+
+              let mut trainer: TrainerWrapper = trainer.into();
+
+              eprintln!("Training target vocabulary size: {vocab_size}");
+
+              tokenizer
+                  .train_from_files(&mut trainer, vec![input.clone()])
+                  .map_err(|e| anyhow!(e.to_string()))?;
+
+              let train_seconds = started.elapsed().as_secs_f64();
+
+              let tokenizer_path = out_dir.join("tokenizer.json");
+              tokenizer
+                  .save(&tokenizer_path, false)
+                  .map_err(|e| anyhow!(e.to_string()))?;
+
+              let actual_vocab_size = tokenizer.get_vocab_size(true);
+
+              // Input was already split into bounded, newline-terminated records.
+              // Encoding each record separately limits peak encoding memory.
+              let reader = BufReader::new(File::open(input)?);
+              let mut reader = reader;
+              let mut output =
+                  BufWriter::new(File::create(out_dir.join("ids.u16le"))?);
+
+              let mut record = Vec::new();
+              let mut input_bytes: u64 = 0;
+              let mut token_count: u64 = 0;
+              let mut record_count: u64 = 0;
+              let encode_started = Instant::now();
+
+              loop {
+                  record.clear();
+                  let n = reader.read_until(b'\n', &mut record)?;
+                  if n == 0 {
+                      break;
+                  }
+
+                  let text = std::str::from_utf8(&record)
+                      .context("Prepared text is not valid UTF-8")?;
+
+                  let encoded = tokenizer
+                      .encode(text, false)
+                      .map_err(|e| anyhow!(e.to_string()))?;
+
+                  // Exact byte-for-byte roundtrip, including all whitespace.
+                  let restored = tokenizer
+                      .decode(encoded.get_ids(), false)
+                      .map_err(|e| anyhow!(e.to_string()))?;
+
+                  if restored.as_bytes() != record.as_slice() {
+                      bail!("Roundtrip mismatch at record {}", record_count);
+                  }
+
+                  for &id in encoded.get_ids() {
+                      let id = u16::try_from(id)
+                          .context("Token ID does not fit in u16")?;
+                      output.write_all(&id.to_le_bytes())?;
+                  }
+
+                  input_bytes += n as u64;
+                  token_count += encoded.get_ids().len() as u64;
+                  record_count += 1;
+              }
+
+              output.flush()?;
+
+              let stats = serde_json::json!({
+                  "requested_vocab": vocab_size,
+                  "actual_vocab": actual_vocab_size,
+                  "input_bytes": input_bytes,
+                  "token_count": token_count,
+                  "ids_raw_bytes": token_count * 2,
+                  "tokenizer_raw_bytes": fs::metadata(&tokenizer_path)?.len(),
+                  "records": record_count,
+                  "train_seconds": train_seconds,
+                  "encode_and_verify_seconds": encode_started.elapsed().as_secs_f64(),
+                  "roundtrip_verified": true,
+                  "id_format": "unsigned 16-bit little-endian",
+                  "normalization": "none",
+                  "add_prefix_space": false,
+                  "regex_pre_tokenization": true,
+                  "min_frequency": 4
+              });
+
+              fs::write(
+                  out_dir.join("stats.json"),
+                  serde_json::to_vec_pretty(&stats)?,
+              )?;
+
+              println!("{}", serde_json::to_string_pretty(&stats)?);
+              Ok(())
+          }
+          EOF
+
+          cp bpe-bench/Cargo.toml results/source/
+          cp -r bpe-bench/src results/source/
+
+      - name: Install Rust and build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+
+          {
+            rustc --version
+            cargo --version
+          } | tee -a results/environment.txt
+
+          cargo build --release --manifest-path bpe-bench/Cargo.toml
+
+          cp bpe-bench/target/release/novel-bpe-bench results/dist/
+          cp bpe-bench/Cargo.lock results/source/
+
+      - name: Download Google Drive archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          .venv/bin/gdown "$DRIVE_FILE_ID" \
+            -O work/novel.tar.zst
+
+          test -s work/novel.tar.zst
+
+          zstd -t work/novel.tar.zst
+          sha256sum work/novel.tar.zst | tee results/download.sha256
+          stat -c '%s' work/novel.tar.zst \
+            > results/download-archive-bytes.txt
+
+      - name: Extract text and convert to UTF-8
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          zstd -d -f work/novel.tar.zst -o work/novel.tar
+
+          cat > work/prepare.py <<'PY'
+          import codecs
+          import hashlib
+          import json
+          import tarfile
+          from pathlib import Path
+
+          archive = Path("work/novel.tar")
+          output = Path("work/novel.utf8.txt")
+          training = Path("work/train.utf8.txt")
+
+          # Restrict total text payload to protect against accidental huge archives.
+          max_text_bytes = 512 * 1024 * 1024
+          reports = []
+
+          with tarfile.open(archive, "r:") as tf:
+              # Read regular .txt members directly; do not extract paths to disk.
+              members = [
+                  m for m in tf.getmembers()
+                  if m.isfile()
+                  and m.name.lower().endswith(".txt")
+                  and not m.name.startswith("__MACOSX/")
+                  and not Path(m.name).name.startswith("._")
+              ]
+              members.sort(key=lambda m: m.name)
+
+              if not members:
+                  raise RuntimeError("Archive contains no regular .txt files")
+
+              if sum(m.size for m in members) > max_text_bytes:
+                  raise RuntimeError("Text payload exceeds 512 MiB safety limit")
+
+              with output.open("wb") as dst:
+                  for member in members:
+                      handle = tf.extractfile(member)
+                      if handle is None:
+                          raise RuntimeError(f"Cannot read: {member.name}")
+
+                      raw = handle.read()
+
+                      # Preserve an existing UTF-8 BOM rather than dropping it.
+                      if raw.startswith(codecs.BOM_UTF8):
+                          text = raw.decode("utf-8", errors="strict")
+                          encoding = "utf-8 (BOM preserved)"
+                      elif raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                          raise RuntimeError(
+                              f"{member.name}: looks like UTF-16; "
+                              "please explicitly adjust the conversion"
+                          )
+                      else:
+                          try:
+                              text = raw.decode("utf-8", errors="strict")
+                              encoding = "utf-8"
+                          except UnicodeDecodeError:
+                              text = raw.decode("gb18030", errors="strict")
+                              encoding = "gb18030"
+
+                      converted = text.encode("utf-8")
+                      dst.write(converted)
+
+                      reports.append({
+                          "archive_member": member.name,
+                          "source_encoding": encoding,
+                          "source_bytes": len(raw),
+                          "utf8_bytes": len(converted),
+                          "unicode_characters": len(text),
+                      })
+
+          # Build bounded training records without changing the original baseline.
+          #
+          # Existing line endings are preserved. Very long lines are split at
+          # Unicode boundaries; inserted newlines exist ONLY in the training file.
+          # The benchmark executable is subsequently run on a separate exact
+          # original-text encoding path (see below).
+          #
+          # To let one Rust input drive both training and encoding without changing
+          # the bytes, instead we retain the original file here and enforce a
+          # maximum original line length. Ordinary novel paragraphs are much shorter.
+          max_line_bytes = 0
+          with output.open("rb") as src:
+              for line in src:
+                  max_line_bytes = max(max_line_bytes, len(line))
+
+          if max_line_bytes > 256 * 1024:
+              raise RuntimeError(
+                  f"Longest line is {max_line_bytes} bytes (>256 KiB). "
+                  "This workflow expects paragraph/newline-formatted novels. "
+                  "Use explicit separate training/encoding chunking for this file."
+              )
+
+          # No copies or transformations are needed: training and encoding use
+          # the exact same converted text.
+          if training.exists():
+              training.unlink()
+          training.hardlink_to(output)
+
+          h = hashlib.sha256()
+          with output.open("rb") as src:
+              while block := src.read(1024 * 1024):
+                  h.update(block)
+
+          report = {
+              "files": reports,
+              "concatenation": (
+                  "All regular .txt members in lexicographic archive-name order, "
+                  "with no inserted separators"
+              ),
+              "total_utf8_bytes": output.stat().st_size,
+              "total_unicode_characters": sum(
+                  item["unicode_characters"] for item in reports
+              ),
+              "max_line_bytes": max_line_bytes,
+              "utf8_sha256": h.hexdigest(),
+          }
+
+          if report["total_utf8_bytes"] == 0:
+              raise RuntimeError("Converted text is empty")
+
+          Path("results/input.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+          python3 work/prepare.py
+
+          # The downloaded archive and intermediate tar are no longer needed.
+          rm work/novel.tar work/novel.tar.zst
+
+      - name: Compute zstd baselines
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Single compression thread for predictable memory use.
+          /usr/bin/time -v -o results/logs/baseline-normal.time \
+            zstd "-${ZSTD_LEVEL}" -T1 -f \
+            work/novel.utf8.txt -o work/baseline-normal.zst
+
+          /usr/bin/time -v -o results/logs/baseline-long.time \
+            zstd "-${ZSTD_LEVEL}" -T1 --long=26 -f \
+            work/novel.utf8.txt -o work/baseline-long.zst
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = {
+              "utf8_bytes": Path("work/novel.utf8.txt").stat().st_size,
+              "zstd_level": int(os.environ["ZSTD_LEVEL"]),
+              "zstd_normal_bytes": Path("work/baseline-normal.zst").stat().st_size,
+              "zstd_long26_bytes": Path("work/baseline-long.zst").stat().st_size,
+              "primary_comparison": "zstd -LEVEL -T1 --long=26",
+          }
+
+          Path("results/baseline.json").write_text(
+              json.dumps(report, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(report, indent=2))
+          PY
+
+          rm work/baseline-normal.zst work/baseline-long.zst
+
+      - name: Train all vocabulary sizes sequentially
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for vocab in 4096 8192 16384 32768 65536; do
+            echo "::group::Vocabulary ${vocab}"
+
+            out="results/vocab-${vocab}"
+            mkdir -p "$out"
+
+            free -h | tee "results/logs/${vocab}-memory-before.txt"
+
+            # Each vocabulary gets a fresh process. Its memory is released on exit.
+            set +e
+            /usr/bin/time -v \
+              -o "results/logs/${vocab}.time" \
+              timeout --signal=TERM --kill-after=30s \
+                "${PER_VOCAB_MINUTES}m" \
+                results/dist/novel-bpe-bench \
+                work/train.utf8.txt "$vocab" "$out" \
+                > "results/logs/${vocab}.stdout.log" \
+                2> "results/logs/${vocab}.stderr.log"
+            rc=$?
+            set -e
+
+            cat "results/logs/${vocab}.stdout.log"
+            tail -n 30 "results/logs/${vocab}.stderr.log"
+
+            echo "$rc" > "$out/exit-code.txt"
+
+            if [[ "$rc" -eq 0 ]]; then
+              # Match the PRIMARY original-text baseline parameters.
+              zstd "-${ZSTD_LEVEL}" -T1 --long=26 -f \
+                "$out/tokenizer.json" \
+                -o "$out/tokenizer.json.zst"
+
+              zstd "-${ZSTD_LEVEL}" -T1 --long=26 -f \
+                "$out/ids.u16le" \
+                -o "$out/ids.u16le.zst"
+
+              OUT_DIR="$out" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["OUT_DIR"])
+          stats = json.loads((p / "stats.json").read_text())
+
+          stats["tokenizer_zstd_bytes"] = (
+              p / "tokenizer.json.zst"
+          ).stat().st_size()
+          stats["ids_zstd_bytes"] = (
+              p / "ids.u16le.zst"
+          ).stat().st_size()
+          stats["total_zstd_bytes"] = (
+              stats["tokenizer_zstd_bytes"] + stats["ids_zstd_bytes"]
+          )
+
+          (p / "stats.json").write_text(
+              json.dumps(stats, indent=2),
+              encoding="utf-8",
+          )
+          PY
+
+              # Do not publish the novel's encoded body.
+              # Only measurements, tokenizer, program, and source are artifacts.
+              rm "$out/ids.u16le" "$out/ids.u16le.zst"
+            else
+              echo "Vocabulary ${vocab} failed with exit code ${rc}; continuing."
+              rm -f "$out/ids.u16le" "$out/ids.u16le.zst"
+            fi
+
+            echo "::endgroup::"
+          done
+
+      - name: Generate report
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path("results")
+          root.mkdir(exist_ok=True)
+
+          baseline_path = root / "baseline.json"
+          baseline = (
+              json.loads(baseline_path.read_text())
+              if baseline_path.exists() else {}
+          )
+
+          primary = baseline.get("zstd_long26_bytes")
+          raw = baseline.get("utf8_bytes")
+
+          rows = []
+          lines = [
+              "# Novel BPE compression benchmark",
+              "",
+              "Primary comparison uses matching zstd level, one thread, "
+              "and `--long=26` on both sides.",
+              "",
+          ]
+
+          if baseline:
+              lines += [
+                  f"- UTF-8 original: **{raw:,} bytes**",
+                  f"- Normal-window zstd: "
+                  f"**{baseline['zstd_normal_bytes']:,} bytes**",
+                  f"- Long-window zstd: **{primary:,} bytes**",
+                  f"- zstd level: **{baseline['zstd_level']}**",
+                  "",
+              ]
+
+          lines += [
+              "| Target | Actual | Tokens | Dictionary .zst | IDs .zst | "
+              "Total | Saving vs long zstd | Peak RSS MiB | Train sec | Status |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|",
+          ]
+
+          for vocab in [4096, 8192, 16384, 32768, 65536]:
+              p = root / f"vocab-{vocab}"
+              stats_path = p / "stats.json"
+              code_path = p / "exit-code.txt"
+              time_path = root / "logs" / f"{vocab}.time"
+
+              rss_mib = None
+              if time_path.exists():
+                  match = re.search(
+                      r"Maximum resident set size \(kbytes\):\s*(\d+)",
+                      time_path.read_text(errors="replace"),
+                  )
+                  if match:
+                      rss_mib = int(match.group(1)) / 1024
+
+              code = (
+                  code_path.read_text().strip()
+                  if code_path.exists() else "not run"
+              )
+
+              stats = (
+                  json.loads(stats_path.read_text())
+                  if stats_path.exists() else {}
+              )
+
+              ok = code == "0" and "total_zstd_bytes" in stats
+
+              if ok:
+                  total = stats["total_zstd_bytes"]
+                  saving = 100 * (1 - total / primary) if primary else None
+                  row = {
+                      "target_vocab": vocab,
+                      "actual_vocab": stats["actual_vocab"],
+                      "tokens": stats["token_count"],
+                      "dictionary_zstd_bytes": stats["tokenizer_zstd_bytes"],
+                      "ids_zstd_bytes": stats["ids_zstd_bytes"],
+                      "total_bytes": total,
+                      "saving_vs_long_zstd_percent": saving,
+                      "peak_rss_mib": rss_mib,
+                      "train_seconds": stats["train_seconds"],
+                      "status": "OK",
+                  }
+
+                  rss_text = f"{rss_mib:.1f}" if rss_mib is not None else "-"
+                  saving_text = f"{saving:+.2f}%" if saving is not None else "-"
+
+                  lines.append(
+                      f"| {vocab} | {stats['actual_vocab']} | "
+                      f"{stats['token_count']:,} | "
+                      f"{stats['tokenizer_zstd_bytes']:,} | "
+                      f"{stats['ids_zstd_bytes']:,} | {total:,} | "
+                      f"{saving_text} | {rss_text} | "
+                      f"{stats['train_seconds']:.1f} | OK |"
+                  )
+              else:
+                  if code == "124":
+                      status = "TIMEOUT"
+                  elif code == "137":
+                      status = "SIGKILL: inspect logs / possible OOM"
+                  elif code == "not run":
+                      status = "NOT RUN"
+                  elif code == "0":
+                      status = "POSTPROCESSING INCOMPLETE"
+                  else:
+                      status = f"FAILED ({code})"
+
+                  row = {
+                      "target_vocab": vocab,
+                      "actual_vocab": None,
+                      "tokens": None,
+                      "dictionary_zstd_bytes": None,
+                      "ids_zstd_bytes": None,
+                      "total_bytes": None,
+                      "saving_vs_long_zstd_percent": None,
+                      "peak_rss_mib": rss_mib,
+                      "train_seconds": stats.get("train_seconds"),
+                      "status": status,
+                  }
+
+                  rss_text = f"{rss_mib:.1f}" if rss_mib is not None else "-"
+                  lines.append(
+                      f"| {vocab} | - | - | - | - | - | - | "
+                      f"{rss_text} | - | {status} |"
+                  )
+
+              rows.append(row)
+
+          successful = [r for r in rows if r["status"] == "OK"]
+          if successful:
+              best = min(successful, key=lambda r: r["total_bytes"])
+              lines += [
+                  "",
+                  f"Best tested vocabulary: **{best['target_vocab']}**, "
+                  f"total **{best['total_bytes']:,} bytes**.",
+              ]
+
+          lines += [
+              "",
+              "Positive saving means BPE + zstd is smaller than the "
+              "long-window zstd baseline.",
+              "",
+              "Dictionary cost includes the entire compressed tokenizer JSON. "
+              "The benchmark verifies byte-exact restoration of every encoded "
+              "text record.",
+              "",
+              "Peak RSS covers training plus encoding/verification, "
+              "not the separate zstd processes.",
+              "",
+              "Artifact contains Linux x86-64 executable, Rust source and lockfile, "
+              "tokenizers, logs, and measurements. The original novel and token-ID "
+              "body are not uploaded.",
+          ]
+
+          report = "\n".join(lines) + "\n"
+          (root / "REPORT.md").write_text(report, encoding="utf-8")
+          (root / "summary.json").write_text(
+              json.dumps(rows, indent=2), encoding="utf-8"
+          )
+
+          with (root / "summary.csv").open("w", newline="") as f:
+              writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+              writer.writeheader()
+              writer.writerows(rows)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as f:
+                  f.write(report)
+
+          print(report)
+          PY
+
+      - name: Package artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Defensive cleanup if a prior step was interrupted.
+          find results -type f \
+            \( -name 'ids.u16le' -o -name 'ids.u16le.zst' \) \
+            -delete
+
+          # Tar preserves executable permission on the Rust binary.
+          tar -czf novel-bpe-results.tar.gz -C results .
+
+      - name: Upload program, tokenizers, and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: novel-bpe-results
+          path: novel-bpe-results.tar.gz
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
